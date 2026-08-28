@@ -21,6 +21,8 @@ import {
   openFileWithinRoot,
   parseError,
   resolveFilePathOnVolume,
+  isAllowedResourceName,
+  isAllowedBucketName,
 } from './utils.js';
 
 describe('utils', () => {
@@ -379,3 +381,84 @@ describe('utils', () => {
     });
   });
 });
+
+  describe('isAllowedResourceName', () => {
+    it('accepts valid kubernetes resource names', () => {
+      expect(isAllowedResourceName('my-pod')).toBe(true);
+      expect(isAllowedResourceName('pod123')).toBe(true);
+      expect(isAllowedResourceName('a')).toBe(true);
+      expect(isAllowedResourceName('my-namespace')).toBe(true);
+    });
+
+    it('rejects names with dots', () => {
+      expect(isAllowedResourceName('my.pod')).toBe(false);
+      expect(isAllowedResourceName('my-org.my-env')).toBe(false);
+    });
+
+    it('rejects invalid names', () => {
+      expect(isAllowedResourceName('')).toBe(false);
+      expect(isAllowedResourceName('-invalid')).toBe(false);
+      expect(isAllowedResourceName('invalid-')).toBe(false);
+      expect(isAllowedResourceName('INVALID')).toBe(false);
+      expect(isAllowedResourceName('my_pod')).toBe(false);
+      expect(isAllowedResourceName(undefined)).toBe(false);
+      expect(isAllowedResourceName(null)).toBe(false);
+      expect(isAllowedResourceName(123)).toBe(false);
+    });
+  });
+
+  describe('isAllowedBucketName', () => {
+    it('accepts valid S3 bucket names with dots', () => {
+      expect(isAllowedBucketName('my-org.my-env.pipelines')).toBe(true);
+      expect(isAllowedBucketName('my.bucket.name')).toBe(true);
+      expect(isAllowedBucketName('bucket-with-dash')).toBe(true);
+      expect(isAllowedBucketName('bucket123')).toBe(true);
+      expect(isAllowedBucketName('abc')).toBe(true);
+    });
+
+    it('accepts bucket names with hyphens and numbers', () => {
+      expect(isAllowedBucketName('my-bucket-123')).toBe(true);
+      expect(isAllowedBucketName('test-bucket-01')).toBe(true);
+    });
+
+    it('rejects names that are too short', () => {
+      expect(isAllowedBucketName('ab')).toBe(false);
+      expect(isAllowedBucketName('a')).toBe(false);
+      expect(isAllowedBucketName('')).toBe(false);
+    });
+
+    it('rejects names that are too long', () => {
+      const longName = 'a'.repeat(64);
+      expect(isAllowedBucketName(longName)).toBe(false);
+    });
+
+    it('rejects names starting or ending with special characters', () => {
+      expect(isAllowedBucketName('-bucket')).toBe(false);
+      expect(isAllowedBucketName('bucket-')).toBe(false);
+      expect(isAllowedBucketName('.bucket')).toBe(false);
+      expect(isAllowedBucketName('bucket.')).toBe(false);
+    });
+
+    it('rejects uppercase letters', () => {
+      expect(isAllowedBucketName('MyBucket')).toBe(false);
+      expect(isAllowedBucketName('MY-BUCKET')).toBe(false);
+    });
+
+    it('rejects IP address format', () => {
+      expect(isAllowedBucketName('192.168.1.1')).toBe(false);
+      expect(isAllowedBucketName('1.2.3.4')).toBe(false);
+    });
+
+    it('rejects invalid characters', () => {
+      expect(isAllowedBucketName('my_bucket')).toBe(false);
+      expect(isAllowedBucketName('my@bucket')).toBe(false);
+      expect(isAllowedBucketName('my bucket')).toBe(false);
+    });
+
+    it('rejects non-string values', () => {
+      expect(isAllowedBucketName(undefined)).toBe(false);
+      expect(isAllowedBucketName(null)).toBe(false);
+      expect(isAllowedBucketName(123)).toBe(false);
+      expect(isAllowedBucketName({})).toBe(false);
+    });
+  });

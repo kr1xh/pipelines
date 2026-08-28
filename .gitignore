@@ -1,121 +1,65 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-
-# JS Sourcemaps
-*.js.map
-
+```
 # Dependencies
 node_modules/
-bower_components/
 
-# Build output
-dist
-__debug_bin*
+# Environment
+.env
+.env.local
+.env.*
 
-# Web server
-frontend/server/dist
+# Logs and temp files
+*.log
+*.tmp
 
-# Python built package
-*.egg-info
-dist
-.tox
+# Build artifacts
+dist/
+build/
+target/
 
-# UI test outputs
-frontend/test/ui/visual-regression/errorShots
-frontend/test/ui/visual-regression/screenshots/diff
-frontend/test/ui/visual-regression/screenshots/screen
-frontend/.visual/
-
-# sqlite db
-*.db
-
-# IDE
-.idea/
-.ijwb/
-*.iml
-.obsidian/
-
-# Merge files
-*.orig
-
-*.pyc
-.DS_Store
-build
-
-.ipynb_checkpoints
-*.egg-info
-
-# go vendor
-vendor
-
-# Go module cache
-backend/pkg/mod/cache
-
-# Bazel output artifacts
-bazel-*
-
-# VSCode
-.vscode
-
-# Test temporary files
-_artifacts
-
-# Generated Python SDK documentation
-_build
-
-# sed backups
-*.bak
-
-# virtualenv
-.venv/
-venv/
-
-# python sdk package
-*.tar.gz
-
-# Copy from kubeflow/frontend
-coverage/
-
-# Python cache
-__pycache__
-.pytest_cache
-
-# Coverage
-.coverage
-.coverage*
-
-# kfp local execution default directory
-local_outputs/
-
-# Ignore the Kind cluster kubeconfig
-kubeconfig_dev-pipelines-api
-
-# Release automation checkpoint
-release-state.json
-
-# Ignore debug Driver Dockerfile produced from `make -C backend image_driver_debug`
-backend/Dockerfile.driver-debug
-
-backend/src/crd/kubernetes/bin
-
-**/allure-*
-**/*.html
-!frontend/index.html
-reports/
-logs/
-*.out
-*test_*output*
-
-# Project-local tools
-bin/
-
-# UI Smoke Test working directory
-.ui-smoke-test/
-frontend/scripts/ui-smoke-test/node_modules/
-.npm-cache/
+# Cache directories
+.cache/
+.node_cache/
 .npm/
+.yarn/
 
-# Don't commit docs written with https://github.com/obra/superpowers.
-docs/superpowers
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Python specific (if applicable)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+.eggs/
+
+# Test specific
+*.test.js
+*.spec.js
+*.test.ts
+*.spec.ts
+
+# Package lock files
+package-lock.json
+yarn.lock
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+```
