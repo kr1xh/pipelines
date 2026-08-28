@@ -506,3 +506,29 @@ export function isAllowedResourceName(name: unknown): name is string {
     /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name)
   );
 }
+
+/**
+ * Validates S3 bucket names according to AWS S3 naming rules.
+ * S3 bucket names can contain lowercase letters, numbers, hyphens, and periods.
+ * They must be between 3-63 characters long, start and end with a letter or number,
+ * and cannot be formatted as an IP address.
+ * See: https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
+ */
+export function isAllowedBucketName(name: unknown): name is string {
+  if (typeof name !== 'string' || name.length < 3 || name.length > 63) {
+    return false;
+  }
+  // Must start and end with a letter or number
+  if (!/^[a-z0-9]/.test(name) || !/[a-z0-9]$/.test(name)) {
+    return false;
+  }
+  // Can contain lowercase letters, numbers, hyphens, and periods
+  if (!/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(name)) {
+    return false;
+  }
+  // Cannot be formatted as an IP address
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name)) {
+    return false;
+  }
+  return true;
+}
