@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	apiclient "github.com/kubeflow/pipelines/backend/src/v2/apiclient"
 	"google.golang.org/grpc"
@@ -45,17 +46,29 @@ type flakyArtifactTaskMockAPI struct {
 type disruptionArtifactService struct {
 	apiv2beta1.UnimplementedArtifactServiceServer
 
-	failCreateArtifactTasks bool
+	failCreateArtifactTasks  bool
+	blockCreateArtifactsBulk bool
 
 	createArtifactsBulkCalls     int
 	createArtifactTasksBulkCalls int
+
+	artifactsBulkEntered chan struct{}
+	artifactsBulkCtxDone chan struct{}
 }
 
 func (s *disruptionArtifactService) CreateArtifactsBulk(
-	context.Context,
-	*apiv2beta1.CreateArtifactsBulkRequest,
+	ctx context.Context,
+	_ *apiv2beta1.CreateArtifactsBulkRequest,
 ) (*apiv2beta1.CreateArtifactsBulkResponse, error) {
 	s.createArtifactsBulkCalls++
+
+	if s.blockCreateArtifactsBulk {
+		close(s.artifactsBulkEntered)
+		<-ctx.Done()
+		close(s.artifactsBulkCtxDone)
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+
 	return &apiv2beta1.CreateArtifactsBulkResponse{}, nil
 }
 
@@ -72,6 +85,25 @@ func (s *disruptionArtifactService) CreateArtifactTasksBulk(
 	return &apiv2beta1.CreateArtifactTasksBulkResponse{}, nil
 }
 
+type blockingArtifactService struct {
+	apiv2beta1.UnimplementedArtifactServiceServer
+
+	callStarted     chan struct{}
+	contextCanceled chan struct{}
+}
+
+func (s *blockingArtifactService) CreateArtifactsBulk(
+	ctx context.Context,
+	_ *apiv2beta1.CreateArtifactsBulkRequest,
+) (*apiv2beta1.CreateArtifactsBulkResponse, error) {
+	close(s.callStarted)
+
+	<-ctx.Done()
+	close(s.contextCanceled)
+
+	return nil, ctx.Err()
+}
+
 type disruptionRunService struct {
 	apiv2beta1.UnimplementedRunServiceServer
 
@@ -84,6 +116,27 @@ func (s *disruptionRunService) UpdateTasksBulk(
 ) (*apiv2beta1.UpdateTasksBulkResponse, error) {
 	s.updateTasksBulkCalls++
 	return &apiv2beta1.UpdateTasksBulkResponse{}, nil
+}
+
+type restartDuringReadRunService struct {
+	apiv2beta1.UnimplementedRunServiceServer
+
+	getRunCalls    int
+	getRunEntered  chan struct{}
+	getRunCanceled chan struct{}
+}
+
+func (s *restartDuringReadRunService) GetRun(
+	ctx context.Context,
+	_ *apiv2beta1.GetRunRequest,
+) (*apiv2beta1.Run, error) {
+	s.getRunCalls++
+	close(s.getRunEntered)
+
+	<-ctx.Done()
+	close(s.getRunCanceled)
+
+	return nil, status.FromContextError(ctx.Err()).Err()
 }
 
 func (m *orderingMockAPI) CreateArtifactsBulk(ctx context.Context, req *apiv2beta1.CreateArtifactsBulkRequest) (*apiv2beta1.CreateArtifactsBulkResponse, error) {
@@ -456,4 +509,199 @@ func TestBatchUpdater_FlushResumesAfterNativeAPIUnavailable(t *testing.T) {
 	require.Empty(t, updater.artifacts)
 	require.Empty(t, updater.artifactTasks)
 	require.Empty(t, updater.taskUpdates)
+}
+
+func TestBatchUpdater_FlushStopsOnCallerCancellation(t *testing.T) {
+	grpcServer := grpc.NewServer()
+
+	artifactService := &blockingArtifactService{
+		callStarted:     make(chan struct{}),
+		contextCanceled: make(chan struct{}),
+	}
+
+	apiv2beta1.RegisterArtifactServiceServer(grpcServer, artifactService)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	client, err := apiclient.New(
+		&apiclient.Config{
+			Endpoint: listener.Addr().String(),
+		},
+		nil,
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	api := kfpapi.New(client)
+	updater := NewBatchUpdater()
+
+	updater.QueueArtifact(&apiv2beta1.CreateArtifactRequest{
+		RunId:       "run-1",
+		TaskId:      "task-1",
+		ProducerKey: "output",
+		Artifact: &apiv2beta1.Artifact{
+			Name: "artifact-1",
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	flushDone := make(chan error, 1)
+
+	go func() {
+		flushDone <- updater.Flush(ctx, api)
+	}()
+
+	<-artifactService.callStarted
+
+	cancel()
+
+	<-artifactService.contextCanceled
+
+	err = <-flushDone
+	require.Equal(t, codes.Canceled, status.Code(err))
+}
+
+func TestBatchUpdater_FlushTerminatesWhenNativeRPCDeadlineElapses(t *testing.T) {
+	grpcServer := grpc.NewServer()
+
+	artifactService := &disruptionArtifactService{
+		blockCreateArtifactsBulk: true,
+		artifactsBulkEntered:     make(chan struct{}),
+		artifactsBulkCtxDone:     make(chan struct{}),
+	}
+	runService := &disruptionRunService{}
+
+	apiv2beta1.RegisterArtifactServiceServer(grpcServer, artifactService)
+	apiv2beta1.RegisterRunServiceServer(grpcServer, runService)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	client, err := apiclient.New(
+		&apiclient.Config{
+			Endpoint: listener.Addr().String(),
+		},
+		nil,
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	api := kfpapi.New(client)
+	updater := NewBatchUpdater()
+
+	updater.QueueArtifact(&apiv2beta1.CreateArtifactRequest{
+		RunId:       "run-1",
+		TaskId:      "task-1",
+		ProducerKey: "output",
+		Artifact: &apiv2beta1.Artifact{
+			Name: "artifact-1",
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	flushErr := make(chan error, 1)
+
+	go func() {
+		flushErr <- updater.Flush(ctx, api)
+	}()
+
+	<-artifactService.artifactsBulkEntered
+
+	err = <-flushErr
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+
+	<-artifactService.artifactsBulkCtxDone
+
+	require.Equal(t, 1, artifactService.createArtifactsBulkCalls)
+	require.Equal(t, 0, artifactService.createArtifactTasksBulkCalls)
+	require.Equal(t, 0, runService.updateTasksBulkCalls)
+
+	require.Len(t, updater.artifacts, 1)
+	require.Empty(t, updater.artifactTasks)
+	require.Empty(t, updater.taskUpdates)
+}
+
+func TestBatchUpdater_GetRunFailsWhenNativeAPIServerStopsDuringRead(t *testing.T) {
+	grpcServer := grpc.NewServer()
+
+	runService := &restartDuringReadRunService{
+		getRunEntered:  make(chan struct{}),
+		getRunCanceled: make(chan struct{}),
+	}
+
+	apiv2beta1.RegisterRunServiceServer(grpcServer, runService)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	client, err := apiclient.New(
+		&apiclient.Config{
+			Endpoint: listener.Addr().String(),
+		},
+		nil,
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	api := kfpapi.New(client)
+
+	readErr := make(chan error, 1)
+
+	go func() {
+		_, err := api.GetRun(context.Background(), &apiv2beta1.GetRunRequest{
+			RunId: "run-1",
+		})
+		readErr <- err
+	}()
+
+	<-runService.getRunEntered
+
+	grpcServer.Stop()
+
+	<-runService.getRunCanceled
+
+	err = <-readErr
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, 1, runService.getRunCalls)
 }
