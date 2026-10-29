@@ -17,11 +17,17 @@ package component
 import (
 	"context"
 	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	apiv2 "github.com/kubeflow/pipelines/backend/api/v2/go_client"
+	apiclient "github.com/kubeflow/pipelines/backend/src/v2/apiclient"
 	"github.com/kubeflow/pipelines/backend/src/v2/apiclient/kfpapi"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type orderingMockAPI struct {
@@ -34,6 +40,58 @@ type flakyArtifactTaskMockAPI struct {
 	createArtifactsBulkCalls int
 	createArtifactTaskCalls  int
 	updateTasksBulkCalls     int
+}
+
+type blockingArtifactService struct {
+	apiv2.UnimplementedArtifactServiceServer
+
+	callStarted     chan struct{}
+	contextCanceled chan struct{}
+}
+
+func (s *blockingArtifactService) CreateArtifactsBulk(
+	ctx context.Context,
+	_ *apiv2.CreateArtifactsBulkRequest,
+) (*apiv2.CreateArtifactsBulkResponse, error) {
+	close(s.callStarted)
+	<-ctx.Done()
+	close(s.contextCanceled)
+
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+type deadlineArtifactService struct {
+	apiv2.UnimplementedArtifactServiceServer
+
+	callStarted     chan struct{}
+	contextCanceled chan struct{}
+}
+
+func (s *deadlineArtifactService) CreateArtifactsBulk(
+	ctx context.Context,
+	_ *apiv2.CreateArtifactsBulkRequest,
+) (*apiv2.CreateArtifactsBulkResponse, error) {
+	close(s.callStarted)
+
+	<-ctx.Done()
+	close(s.contextCanceled)
+
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+type shutdownRunService struct {
+	apiv2.UnimplementedRunServiceServer
+
+	callStarted chan struct{}
+}
+
+func (s *shutdownRunService) GetRun(
+	ctx context.Context,
+	_ *apiv2.GetRunRequest,
+) (*apiv2.Run, error) {
+	close(s.callStarted)
+	<-ctx.Done()
+	return nil, status.FromContextError(ctx.Err()).Err()
 }
 
 func (m *orderingMockAPI) CreateArtifactsBulk(ctx context.Context, req *apiv2.CreateArtifactsBulkRequest) (*apiv2.CreateArtifactsBulkResponse, error) {
@@ -322,4 +380,179 @@ func TestBatchUpdater_GetMetricsAccumulatesAcrossFlushes(t *testing.T) {
 
 	metrics := updater.GetMetrics()
 	require.Equal(t, 2, metrics["actual_task_update_calls"])
+}
+
+func TestBatchUpdater_FlushStopsOnCallerCancellation(t *testing.T) {
+	grpcServer := grpc.NewServer()
+	artifactService := &blockingArtifactService{
+		callStarted:     make(chan struct{}),
+		contextCanceled: make(chan struct{}),
+	}
+
+	apiv2.RegisterArtifactServiceServer(grpcServer, artifactService)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	client, err := apiclient.New(
+		&apiclient.Config{Endpoint: listener.Addr().String()},
+		nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	api := kfpapi.New(client)
+	updater := NewBatchUpdater()
+
+	updater.QueueArtifact(&apiv2.CreateArtifactRequest{
+		RunId:       "run-1",
+		TaskId:      "task-1",
+		ProducerKey: "output",
+		Artifact:    &apiv2.Artifact{Name: "artifact-1"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- updater.Flush(ctx, api)
+	}()
+
+	<-artifactService.callStarted
+	cancel()
+
+	<-artifactService.contextCanceled
+	err = <-flushDone
+
+	require.Equal(t, codes.Canceled, status.Code(err))
+	require.Len(t, updater.artifacts, 1)
+}
+
+func TestBatchUpdater_FlushTerminatesWhenNativeRPCDeadlineElapses(t *testing.T) {
+	grpcServer := grpc.NewServer()
+	artifactService := &blockingArtifactService{
+		callStarted:     make(chan struct{}),
+		contextCanceled: make(chan struct{}),
+	}
+
+	apiv2.RegisterArtifactServiceServer(grpcServer, artifactService)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	client, err := apiclient.New(
+		&apiclient.Config{Endpoint: listener.Addr().String()},
+		nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	api := kfpapi.New(client)
+	updater := NewBatchUpdater()
+
+	updater.QueueArtifact(&apiv2.CreateArtifactRequest{
+		RunId:       "run-1",
+		TaskId:      "task-1",
+		ProducerKey: "output",
+		Artifact:    &apiv2.Artifact{Name: "artifact-1"},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- updater.Flush(ctx, api)
+	}()
+
+	<-artifactService.callStarted
+	err = <-flushDone
+
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+
+	<-artifactService.contextCanceled
+
+	require.Len(t, updater.artifacts, 1)
+	require.Empty(t, updater.artifactTasks)
+	require.Empty(t, updater.taskUpdates)
+}
+
+func TestBatchUpdater_GetRunFailsWhenNativeAPIServerStopsDuringRead(t *testing.T) {
+	grpcServer := grpc.NewServer()
+	runService := &shutdownRunService{
+		callStarted: make(chan struct{}),
+	}
+	apiv2.RegisterRunServiceServer(grpcServer, runService)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	client, err := apiclient.New(
+		&apiclient.Config{Endpoint: listener.Addr().String()},
+		nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	api := kfpapi.New(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := api.GetRun(ctx, &apiv2.GetRunRequest{
+			RunId: "run-1",
+		})
+		readDone <- err
+	}()
+
+	select {
+	case <-runService.callStarted:
+	case <-ctx.Done():
+		t.Fatal("GetRun request did not reach the server")
+	}
+
+	grpcServer.Stop()
+
+	select {
+	case err := <-readDone:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Unavailable")
+	case <-ctx.Done():
+		t.Fatal("GetRun did not fail after the server stopped")
+	}
 }
